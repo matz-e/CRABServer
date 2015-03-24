@@ -71,9 +71,11 @@ import classad
 import commands
 import unittest
 import datetime
+import tarfile
 import tempfile
 import traceback
 import WMCore.Database.CMSCouch as CMSCouch
+from WMCore.DataStructs.LumiList import LumiList
 from RESTInteractions import HTTPRequests ## Why not to use from WMCore.Services.Requests import Requests
 from httplib import HTTPException
 import hashlib
@@ -934,6 +936,9 @@ class PostJob():
 
         ## Parse the job ad.
         job_ad_file_name = os.environ.get("_CONDOR_JOB_AD", ".job.ad")
+        self.logger.info("ARGH!")
+        self.logger.info(os.listdir(os.path.dirname(job_ad_file_name)))
+        self.logger.info(os.listdir('.'))
         self.logger.info("====== Starting to parse job ad file %s." % (job_ad_file_name))
         parse_job_ad_status = self.parse_job_ad(job_ad_file_name)
         if parse_job_ad_status is not OK:
@@ -1012,6 +1017,28 @@ class PostJob():
             self.logger.info("====== Finished to parse job report.")
             return RetryJob.FATAL_ERROR
         self.logger.info("====== Finished to parse job report.")
+
+        ## Parse the lumis send to process
+        self.logger.info("====== Starting to parse the lumi file")
+        try:
+            tmpdir = tempfile.mkdtemp()
+            f = tarfile.open("run_and_lumis.tar.gz")
+            fn = "job_lumis_{0}.json".format(self.job_id)
+            f.extract(fn, path=tmpdir)
+            with open(os.path.join(tmpdir, fn)) as fd:
+                injson = json.load(fd)
+                inlumis = LumiList(compactList=injson)
+
+            outlumis = LumiList()
+            for input in self.job_report['steps']['cmsRun']['input']['source']:
+                outlumis += LumiList(runsAndLumis=input['runs'])
+
+            self.logger.info("Lumis expected to be processed: {0}".format(len(inlumis.getLumis())))
+            self.logger.info("Lumis actually processed:       {0}".format(len(outlumis.getLumis())))
+            self.logger.info("Difference in lumis:            {0}".format(len((inlumis - outlumis).getLumis())))
+        finally:
+            f.close()
+            shutil.rmtree(tmpdir)
 
         ## AndresT. We don't need this method IMHO. See note I made in the method.
         self.fix_job_logs_permissions()
