@@ -55,6 +55,12 @@ ABORT-DAG-ON Job%(count)d 3
 
 """
 
+SUBDAG_FRAGMENT = """
+SUBDAG EXTERNAL Job%(count)d_0 RunJob%(count)d.subdag
+PARENT Job%(count)d CHILD Job%(count)d_0
+
+"""
+
 CRAB_HEADERS = \
 """
 +CRAB_ReqName = %(requestname)s
@@ -535,6 +541,7 @@ class DagmanCreator(TaskAction.TaskAction):
 
         startjobid = 0
         dagSpecs = []
+        subdags = []
 
         if hasattr(self.config.TaskWorker, 'stageoutPolicy'):
             kwargs['task']['stageoutpolicy'] = ",".join(self.config.TaskWorker.stageoutPolicy)
@@ -635,6 +642,13 @@ class DagmanCreator(TaskAction.TaskAction):
         dag = DAG_HEADER % {'resthost': kwargs['task']['resthost'], 'resturiwfdb': kwargs['task']['resturinoapi'] + '/workflowdb'}
         for dagSpec in dagSpecs:
             dag += DAG_FRAGMENT % dagSpec
+            dag += SUBDAG_FRAGMENT % dagSpec
+
+            ## Create an empty SUBDAG
+            subdag = "RunJob{0}.subdag".format(dagSpec['count'])
+            with open(subdag, "w") as fd:
+                fd.write("")
+            subdags.append(subdag)
 
         ## Create a tarball with all the job lumi files.
         run_and_lumis_tar = tarfile.open("run_and_lumis.tar.gz", "w:gz")
@@ -710,7 +724,7 @@ class DagmanCreator(TaskAction.TaskAction):
                 self.logger.error("Failed to record the number of jobs.")
                 return 1
 
-        return info, splitterResult
+        return info, splitterResult, subdags
 
 
     def executeInternal(self, *args, **kw):
@@ -776,12 +790,12 @@ class DagmanCreator(TaskAction.TaskAction):
             inputFiles.append("TaskManagerRun.tar.gz")
 
         try:
-            info, splitterResult = self.createSubdag(*args, **kw)
+            info, splitterResult, subdags = self.createSubdag(*args, **kw)
         finally:
             if cwd:
                 os.chdir(cwd)
 
-        return TaskWorker.DataObjects.Result.Result(task = kw['task'], result = (temp_dir, info, params, inputFiles, splitterResult))
+        return TaskWorker.DataObjects.Result.Result(task = kw['task'], result = (temp_dir, info, params, inputFiles + subdags, splitterResult))
 
     def execute(self, *args, **kw):
         return self.executeInternal(*args, **kw)
