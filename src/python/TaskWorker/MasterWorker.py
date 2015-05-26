@@ -18,6 +18,7 @@ from RESTInteractions import HTTPRequests
 
 from TaskWorker.WorkerExceptions import *
 from TaskWorker.TestWorker import TestWorker
+from MultiProcessingLog import MultiProcessingLog
 from TaskWorker.Worker import Worker, setProcessLogger
 import TaskWorker.Actions.Recurring.BaseRecurringAction
 from TaskWorker.Actions.Recurring.BaseRecurringAction import handleRecurring
@@ -69,7 +70,7 @@ class MasterWorker(object):
             """
             try:
                 os.mkdir(dirname)
-            except OSError, ose:
+            except OSError as ose:
                 if ose.errno != 17: #ignore the "Directory already exists error"
                     print str(ose)
                     print "The task worker need to access the '%s' directory" % dirname
@@ -94,7 +95,7 @@ class MasterWorker(object):
                 #if we are testing log to the console is easier
                 logging.getLogger().addHandler(logging.StreamHandler())
             else:
-                logHandler = TimedRotatingFileHandler('logs/twlog.txt', 'midnight')
+                logHandler = MultiProcessingLog('logs/twlog.txt', when='midnight')
                 logFormatter = \
                     logging.Formatter("%(asctime)s:%(levelname)s:%(module)s:%(message)s")
                 logHandler.setFormatter(logFormatter)
@@ -107,7 +108,7 @@ class MasterWorker(object):
             logging.getLogger().setLevel(loglevel)
             logger = setProcessLogger("master")
             logger.debug("PID %s." % os.getpid())
-            logger.debug("Logging level initialized to %s." %loglevel)
+            logger.debug("Logging level initialized to %s." % loglevel)
             return logger
 
         self.STOP = False
@@ -157,7 +158,7 @@ class MasterWorker(object):
         configreq = {'subresource': 'process', 'workername': self.config.TaskWorker.name, 'getstatus': getstatus, 'limit': limit, 'status': setstatus}
         try:
             self.server.post(self.restURInoAPI + '/workflowdb', data = urllib.urlencode(configreq))
-        except HTTPException, hte:
+        except HTTPException as hte:
             #Using a msg variable and only one self.logger.error so that messages do not get shuffled
             msg = "Task Worker could not update a task status (HTTPException): %s\nConfiguration parameters=%s\n" % (str(hte), configreq)
             if not hte.headers.get('X-Error-Detail', '') == 'Required object is missing' or \
@@ -172,7 +173,7 @@ class MasterWorker(object):
                 msg += "\turl: %s\n" %(getattr(hte, 'url', 'unknown'))
                 msg += "\tresult: %s\n" %(getattr(hte, 'result', 'unknown'))
             self.logger.error(msg)
-        except Exception, exc:
+        except Exception as exc:
             msg = "Task Worker could not update a task status: %s\nConfiguration parameters=%s\n" % (str(exc), configreq)
             self.logger.error(msg + traceback.format_exc())
 
@@ -183,7 +184,7 @@ class MasterWorker(object):
         pendingwork = []
         try:
             pendingwork = self.server.get(self.restURInoAPI + '/workflowdb', data = configreq)[0]['result']
-        except HTTPException, hte:
+        except HTTPException as hte:
             self.logger.error("HTTP Error during _getWork: %s" % str(hte))
             self.logger.error("Could not get any work from the server: \n" +
                               "\tstatus: %s\n" %(hte.headers.get('X-Error-Http', 'unknown')) +
@@ -193,7 +194,7 @@ class MasterWorker(object):
                 self.logger.error("%s " %(str(traceback.format_exc())))
                 self.logger.error("\turl: %s\n" %(getattr(hte, 'url', 'unknown')))
                 self.logger.error("\tresult: %s\n" %(getattr(hte, 'result', 'unknown')))
-        except Exception, exc:
+        except Exception as exc:
             self.logger.error("Server could not process the request: %s" %(str(exc)))
             self.logger.error(traceback.format_exc())
         return pendingwork
@@ -209,7 +210,7 @@ class MasterWorker(object):
             try:
                 self.server.post(self.restURInoAPI + '/workflowdb', data = urllib.urlencode(configreq))
                 retry = False
-            except HTTPException, hte:
+            except HTTPException as hte:
                 #Using a msg variable and only one self.logger.error so that messages do not get shuffled
                 msg = "Task Worker could not update a task status (HTTPException): %s\nConfiguration parameters=%s\n" % (str(hte), configreq)
                 msg += "\tstatus: %s\n" %(hte.headers.get('X-Error-Http', 'unknown'))
@@ -225,7 +226,7 @@ class MasterWorker(object):
                     time_sleep = 30 + random.randint(10,30)
                     self.logger.info("Sleeping %s seconds and will try to update again." % str(time_sleep))
                     time.sleep(time_sleep)
-            except Exception, exc:
+            except Exception as exc:
                 msg = "Task Worker could not update a task status: %s\nConfiguration parameters=%s\n" % (str(exc), configreq)
                 self.logger.error(msg + traceback.format_exc())
                 retry = False

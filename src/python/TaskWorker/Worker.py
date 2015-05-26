@@ -7,6 +7,7 @@ import traceback
 import multiprocessing
 from Queue import Empty
 from base64 import b64encode
+from httplib import HTTPException
 from logging.handlers import TimedRotatingFileHandler
 
 from RESTInteractions import HTTPRequests
@@ -24,7 +25,7 @@ def processWorker(inputs, results, resthost, resturi, procnum):
        :arg Queue inputs: the queue where the inputs are shared by the master
        :arg Queue results: the queue where this method writes the output
        :return: default returning zero, but not really needed."""
-    logger = logging.getLogger(str(procnum))
+    logger = setProcessLogger(str(procnum))
     logger.info("Process %s is starting. PID %s", procnum, os.getpid())
     procName = "Process-%s" % procnum
     while True:
@@ -44,10 +45,10 @@ def processWorker(inputs, results, resthost, resturi, procnum):
         try:
             msg = None
             outputs = work(resthost, resturi, WORKER_CONFIG, task, procnum, inputargs)
-        except WorkerHandlerException, we:
+        except WorkerHandlerException as we:
             outputs = Result(task=task, err=str(we))
             msg = str(we)
-        except Exception, exc:
+        except Exception as exc:
             outputs = Result(task=task, err=str(exc))
             msg = "%s: I just had a failure for %s" % (procName, str(exc))
             msg += "\n\tworkid=" + str(workid)
@@ -65,8 +66,12 @@ def processWorker(inputs, results, resthost, resturi, procnum):
 
                     server.post(resturi, data = urllib.urlencode(configreq))
                     logger.info("Error message successfully uploaded to the REST")
-                except Exception, exc:
+                except HTTPException as hte:
+                    logger.warning("Cannot upload failure message to the REST for workflow %s. HTTP headers follows:" % task['tm_taskname'])
+                    logger.error(hte.headers)
+                except Exception as exc:
                     logger.warning("Cannot upload failure message to the REST for workflow %s.\nReason: %s" % (task['tm_taskname'], exc))
+                    logger.exception('Traceback follows:')
         t1 = time.time()
         logger.debug("%s: ...work on %s completed in %d seconds: %s" % (procName, task['tm_taskname'], t1-t0, outputs))
 
@@ -128,8 +133,7 @@ class Worker(object):
         if len(self.pool) == 0:
             # Starting things up
             for x in xrange(1, self.nworkers + 1):
-                self.logger.debug("Starting process %i" %x)
-                setProcessLogger(str(x))
+                self.logger.debug("Starting process %i" % x)
                 p = multiprocessing.Process(target = processWorker, args = (self.inputs, self.results, self.resthost, self.resturi, x))
                 p.start()
                 self.pool.append(p)
@@ -142,7 +146,7 @@ class Worker(object):
             try:
                 self.logger.debug("Putting stop message in the queue for %s " % str(x))
                 self.inputs.put(('-1', 'STOP', 'control', []))
-            except Exception, ex:
+            except Exception as ex:
                 msg =  "Hit some exception in deletion\n"
                 msg += str(ex)
                 self.logger.error(msg)
@@ -180,15 +184,15 @@ class Worker(object):
             out = None
             try:
                 out = self.results.get_nowait()
-            except Empty, e:
+            except Empty as e:
                 pass
             if out is not None:
-               self.logger.debug('Retrieved work %s'% str(out))
-               if isinstance(out['out'], list):
-                   allout.extend(out['out'])
-               else:
-                   allout.append(out['out'])
-               del self.working[out['workid']]
+                self.logger.debug('Retrieved work %s'% str(out))
+                if isinstance(out['out'], list):
+                    allout.extend(out['out'])
+                else:
+                    allout.append(out['out'])
+                del self.working[out['workid']]
         return allout
 
     def freeSlaves(self):

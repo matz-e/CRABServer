@@ -4,7 +4,7 @@
 
 #Parameters required to change !
 #------------------------------
-TAG='HG1501'
+TAG='HG1505b'
 VERSION=1
 CMSSW='CMSSW_7_0_6'
 WORK_DIR=/afs/cern.ch/work/j/jbalcas/VALIDATE/$TAG
@@ -39,8 +39,26 @@ function sed_new_data () {
   #Data part
   sed --in-place "s|\.Data\.ignoreLocality = .*|\.Data\.ignoreLocality = $8 |" $1
   sed --in-place "s|\.General\.instance = .*|\.General\.instance = '$INSTANCE' |" $1
+  sed --in-place "s|\.JobType\.disableAutomaticOutputCollection = .*|\.JobType\.disableAutomaticOutputCollection = $9 |" $1
 }
 
+function sed_add_data () {
+  sed --in-place "s|\.JobType\.maxJobRuntimeMin = .*|\.JobType\.maxJobRuntimeMin = $2 |" $1
+  sed --in-place "s|\.JobType\.maxMemoryMB = .*|\.JobType\.maxMemoryMB = $3 |" $1
+  sed --in-place "s|\.JobType\.numCores = .*|\.JobType\.numCores = $4 |" $1
+  sed --in-place "s|\.User\.voRole = .*|\.User\.voRole = $5 |" $1
+  sed --in-place "s|\.User\.voGroup = .*|\.User\.voGroup = $6 |" $1
+  if $7; then
+    sed -i -e "/HammerCloud/s/^#//" $file_name
+  else
+    sed -i -e "/HammerCloud/s/^#*/#/" $file_name
+  fi
+  if $8; then
+    sed -i -e "/stageout/s/^#//" $file_name
+  else
+    sed -i -e "/stageout/s/^#*/#/" $file_name
+  fi
+}
 
 #Get specified CMSSW
 if [ ! -d "$WORK_DIR" ]; then
@@ -81,7 +99,11 @@ do
   new_name=$TAG-$VERSION-$file_name_temp-'L-'$log_v'_O-'$out_v'_P-'$pub_v'_IL-'$ign_v
   publish_name=$new_name-`date +%s`
   echo $new_name
-  sed_new_data $file_name $new_name ${out_cond[$i]} ${log_cond[$i]} $TAG-$VERSION ${pub_cond[$i]} $publish_name ${ign_cond[$i]}
+  sed_new_data $file_name $new_name ${out_cond[$i]} ${log_cond[$i]} $TAG-$VERSION ${pub_cond[$i]} $publish_name ${ign_cond[$i]} False
+  crab submit -c $file_name
+  #Submit same task with disableAutomaticOutputCollection = True
+  new_name=$new_name-'DOC-T'
+  sed_new_data $file_name $new_name ${out_cond[$i]} ${log_cond[$i]} $TAG-$VERSION ${pub_cond[$i]} $publish_name ${ign_cond[$i]} True
   crab submit -c $file_name
 done
 
@@ -94,10 +116,38 @@ do
   new_name=$TAG-$VERSION-$file_name_temp-'L-T_O-T_P-T_IL-F'
   publish_name=$new_name-`date +%s`
   echo $new_name
-  sed_new_data $file_name $new_name True True $TAG-$VERSION True $publish_name False
+  sed_new_data $file_name $new_name True True $TAG-$VERSION True $publish_name False False
+  crab submit -c $file_name
+  #Submit same task with disableAutomaticOutputCollection = True
+  new_name=$new_name-'DOC-T'
+  sed_new_data $file_name $new_name True True $TAG-$VERSION True $publish_name False True
   crab submit -c $file_name
 done
 
+# Number of possible values should be always equal
+add_name=("RuntimeRM" "MemoryRM" "NumCores" "HammerCloud" "Stageout" "voGroupbecms" "voGroupescms" "MemoryBIG" "RuntimeBig")
+wall_cond=(1 1000 1000 1000 1000 1000 1000 1000 3000)
+mem_cond=(2000 20 2000 2000 2000 2000 2000 4000 2000)
+cores_cond=(1 1 2 1 1 1 1 1 1)
+group_cond=('""' '""' '""' '""' '""' '"becms"' '"escms"' '""' '""')
+role_cond=('""' '""' '""' '""' '""' '""' '""' '""' '""')
+hc_cond=(false false false true false false false false false)
+st_cond=(false false false false true false false false false)
+
+#Extra parameters test
+file_name='MinBias_PrivateMC_EventBased_ExtraParams.py'
+file_name_temp=${file_name:0:(${#file_name})-3};
+
+total=${#add_name[*]}
+for ((i=0;i<=$(($total-1));i++));
+do
+  new_name=$TAG-$VERSION-$file_name_temp-'L-T_O-T_P-T-'${add_name[$i]}
+  publish_name=$new_name-`date +%s`
+  echo $new_name
+  sed_new_data $file_name $new_name True True $TAG-$VERSION True $publish_name False False
+  sed_add_data $file_name ${wall_cond[$i]} ${mem_cond[$i]} ${cores_cond[$i]} ${role_cond[$i]} ${group_cond[$i]} ${hc_cond[$i]} ${st_cond[$i]}
+  crab submit -c $file_name
+done
 
 #As for LHE it requires older version of CMSSW. Need to ask Anna to review, she might know for newer version of CMSSW
 CMSSW='CMSSW_5_3_22'
@@ -123,7 +173,12 @@ file_name_temp=${file_name:0:(${#file_name})-3};
 #Generate new name
 new_name=$TAG-$VERSION-$file_name_temp-'L-T_O-T_P-T_IL-F'
 
-sed_new_data $file_name $new_name True True $TAG-$VERSION True $publish_name False
+sed_new_data $file_name $new_name True True $TAG-$VERSION True $publish_name False False
+crab submit -c $file_name
+
+#Submit same task with disableAutomaticOutputCollection = True
+new_name=$new_name-'DOC-T'
+sed_new_data $file_name $new_name True True $TAG-$VERSION True $publish_name False True
 crab submit -c $file_name
 
 
@@ -133,5 +188,10 @@ file_name_temp=${file_name:0:(${#file_name})-3};
 #Generate new name
 new_name=$TAG-$VERSION-$file_name_temp-'L-T_O-T_P-T_IL-F'
 
-sed_new_data $file_name $new_name True True $TAG-$VERSION True $publish_name False
+sed_new_data $file_name $new_name True True $TAG-$VERSION True $publish_name False False
+crab submit -c $file_name
+
+#Submit same task with disableAutomaticOutputCollection = True
+new_name=$new_name-'DOC-T'
+sed_new_data $file_name $new_name True True $TAG-$VERSION True $publish_name False True
 crab submit -c $file_name

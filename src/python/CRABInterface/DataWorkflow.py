@@ -3,13 +3,14 @@ import random
 import logging
 import cherrypy
 from datetime import datetime
+from ast import literal_eval
 
-from CRABInterface.Utils import getDBinstance
-# WMCore dependecies here
+## WMCore dependecies
 from WMCore.REST.Error import ExecutionError
 
-#CRAB dependencies
-from CRABInterface.Utils import CMSSitesCache, conn_handler
+## CRAB dependencies
+from CRABInterface.Utils import CMSSitesCache, conn_handler, getDBinstance
+
 
 class DataWorkflow(object):
     """Entity that allows to operate on workflow resources.
@@ -37,9 +38,6 @@ class DataWorkflow(object):
 	self.Task = getDBinstance(config, 'TaskDB', 'Task')
 	self.JobGroup = getDBinstance(config, 'TaskDB', 'JobGroup')
 	self.FileMetaData = getDBinstance(config, 'FileMetaDataDB', 'FileMetaData')
-
-        #self.failedList = []
-        #self.successList = []
 
     def updateRequest(self, workflow):
         """Provide the implementing class a chance to rename the workflow
@@ -116,7 +114,7 @@ class DataWorkflow(object):
     @conn_handler(services=['centralconfig'])
     def submit(self, workflow, activity, jobtype, jobsw, jobarch, inputdata, use_parent, generator, events_per_lumi, siteblacklist, sitewhitelist, splitalgo, algoargs, cachefilename, cacheurl, addoutputfiles,
                userhn, userdn, savelogsflag, publication, publishname, asyncdest, dbsurl, publishdbsurl, vorole, vogroup, tfileoutfiles, edmoutfiles,
-               runs, lumis, totalunits, adduserfiles, oneEventMode=False, maxjobruntime=None, numcores=None, maxmemory=None, priority=None, lfnprefix=None, lfn=None,
+               runs, lumis, totalunits, adduserfiles, oneEventMode=False, maxjobruntime=None, numcores=None, maxmemory=None, priority=None, lfn=None,
                ignorelocality=None, saveoutput=None, faillimit=10, userfiles=None, userproxy=None, asourl=None, scriptexe=None, scriptargs=None, scheddname=None,
                extrajdl=None, collector=None, dryrun=False):
         """Perform the workflow injection
@@ -158,7 +156,6 @@ class DataWorkflow(object):
            :arg int numcores: number of CPU cores required by job
            :arg int maxmemory: maximum amount of RAM required, in MB
            :arg int priority: priority of this task
-           :arg str lfnprefix: prefix for output directory in /store/user. Deprecated in favour of the parameter below (lfn)
            :arg str lfn: lfn used to store output files.
            :arg str userfiles: The files to process instead of a DBS-based dataset.
            :arg str asourl: Specify which ASO to use for transfers and publishing.
@@ -179,32 +176,32 @@ class DataWorkflow(object):
         try:
             requestname = '%s:%s_%s' % (timestamp, userhn, workflow)
             schedd_name = self.chooseScheduler(scheddname, backend_urls).split(":")[0]
-        except IOError, err:
+        except IOError as err:
             self.logger.debug("Failed to communicate with components %s. Request name %s: " % (str(err), str(requestname)))
             raise ExecutionError("Failed to communicate with crabserver components. If problem persist, please report it.")
         splitArgName = self.splitArgMap[splitalgo]
         username = cherrypy.request.user['login']
         dbSerializer = str
 
-        if numcores == None: numcores = 1
-        if maxjobruntime == None: maxjobruntime = 1315
-        if maxmemory == None: maxmemory = 2000
-        if priority == None: priority = 10
+        ## If these parameters were not set in the submission request, give them
+        ## predefined default values.
+        if maxjobruntime is None:
+            maxjobruntime = 1315
+        if maxmemory is None:
+            maxmemory = 2000
+        if numcores is None:
+            numcores = 1
+        if priority is None:
+            priority = 10
 
         if not asourl:
             asourl = self.centralcfg.centralconfig.get("backend-urls", {}).get("ASOURL", "")
             if type(asourl)==list:
                 asourl = random.choice(asourl)
 
-        arguments = { \
-            'oneEventMode' : 'T' if oneEventMode else 'F',
-            'lfn' : '/store/user/%s/%s' % (username, lfnprefix) if lfnprefix else lfn,
-            'saveoutput' : 'T' if saveoutput else 'F',
-            'faillimit' : faillimit,
-            'ignorelocality' : 'T' if ignorelocality else 'F',
-            'userfiles' : userfiles,
-        }
+        arguments = {}
 
+        ## Insert this new task into the Tasks DB.
         self.api.modify(self.Task.New_sql,
                             task_name       = [requestname],
                             task_activity   = [activity],
@@ -256,57 +253,99 @@ class DataWorkflow(object):
                             asourl          = [asourl],
                             collector       = [collector],
                             schedd_name     = [schedd_name],
-                            dry_run         = ['T' if dryrun else 'F']
+                            dry_run         = ['T' if dryrun else 'F'],
+                            user_files       = [dbSerializer(userfiles)],
+                            transfer_outputs = ['T' if saveoutput else 'F'],
+                            output_lfn       = [lfn],
+                            ignore_locality  = ['T' if ignorelocality else 'F'],
+                            fail_limit       = [faillimit],
+                            one_event_mode   = ['T' if oneEventMode else 'F']
         )
 
         return [{'RequestName': requestname}]
 
-    def resubmit(self, workflow, siteblacklist, sitewhitelist, jobids, maxjobruntime, numcores, maxmemory, priority, userdn, userproxy):
+    def resubmit(self, workflow, siteblacklist, sitewhitelist, jobids, maxjobruntime, numcores, maxmemory, priority, force, userdn, userproxy):
         """Request to reprocess what the workflow hasn't finished to reprocess.
            This needs to create a new workflow in the same campaign
 
            :arg str workflow: a valid workflow name
            :arg str list siteblacklist: black list of sites, with CMS name;
            :arg str list sitewhitelist: white list of sites, with CMS name."""
-
         retmsg = "ok"
-        self.logger.info("About to resubmit workflow: %s. Getting status first." % workflow)
+        self.logger.info("About to resubmit workflow: %s. Getting status first." % (workflow))
+        ## Get the status of the task/jobs.
         statusRes = self.status(workflow, userdn, userproxy)[0]
-
-        #if there are failed jobdef submission we fail
-        #if statusRes['failedJobdefs']:
-        #    raise ExecutionError("You cannot resubmit a task if not all the jobs have been submitted. The feature will be available in the future")
-
-        if statusRes['status'] in ['SUBMITTED', 'KILLED', 'FAILED', 'KILLFAILED']:
-            resubmitList = [jobid for jobstatus, jobid in statusRes['jobList'] if jobstatus in self.failedList]
-            if jobids:
-                #if the user wants to kill specific jobids make the intersection
-                resubmitList = list(set(resubmitList) & set(jobids))
-                #check if all the requested jobids can be resubmitted
-                if len(resubmitList) != len(jobids):
-                    requestedResub = list(set(jobids) - set(resubmitList))
-                    retmsg = "CRAB3 server refused to resubmit these jobs: %s." \
-                             "You cannot resubmit them if they in one of these states: " % (requestedResub, self.failedList)
-                    return [{"result":retmsg}]
-            #if not resubmitList:
-            #    raise ExecutionError("There are no jobs to resubmit. Only jobs in %s states are resubmitted" % self.failedList)
-            self.logger.info("Jobs to resubmit: %s" % resubmitList)
-            args = {"siteBlackList":siteblacklist, "siteWhiteList":sitewhitelist, "resubmitList":resubmitList}
-            if maxjobruntime != None:
-                args['maxjobruntime'] = maxjobruntime
-            if numcores != None:
-                args['numcores'] = numcores
-            if maxmemory != None:
-                args['maxmemory'] = maxmemory
-            if priority != None:
-                args['priority'] = priority
-            self.api.modify(self.Task.SetArgumentsTask_sql, taskname = [workflow],
-                            arguments = [str(args)])
-            self.api.modify(self.Task.SetStatusTask_sql, status = ["RESUBMIT"], taskname = [workflow])
-        else:
-            raise ExecutionError("You cannot resubmit a task if it is in the %s state" % statusRes['status'])
-
-        return [{"result":retmsg}]
+        ## We allow resubmission of jobs only if the task status is one of these:
+        allowedTaskStates = ['SUBMITTED', 'KILLED', 'FAILED', 'KILLFAILED']
+        ## If the user wants to resubmit a specific set of jobs, then we also accept the
+        ## task to be in COMPLETED state. This is because we want to allow resubmission
+        ## of successfully finished jobs if the user explicitly gave the job id.
+        if jobids and force:
+            allowedTaskStates += ['COMPLETED']
+        ## If the task status is not an allowed one, fail the resubmission.
+        if statusRes['status'] not in allowedTaskStates:
+            if statusRes['status'] in ['COMPLETED']:
+                msg = "Task status is COMPLETED. To resubmit jobs from a task in status COMPLETED, use the --jobids and --force options."
+            else:
+                msg = "You cannot resubmit a task if it is in the %s state." % (statusRes['status'])
+            raise ExecutionError(msg)
+        ## This is the list of job ids that we allow to be resubmitted.
+        ## Note: This list will be empty if statusRes['jobList'] is empty to begin with.
+        ## And statusRes['jobList'] may be empty even if jobs were created and have well
+        ## defined state. An example is when the task has status FAILED in the Task DB
+        ## because of an exception in the TaskWorker.
+        resubmitjobids = [jobid for jobstatus, jobid in statusRes['jobList'] if (jobstatus in self.failedList) or (jobids and force and jobstatus in self.successList)]
+        if statusRes['jobList'] and not resubmitjobids:
+            msg  = "There are no jobs to resubmit."
+            msg += " Only jobs in status %s can be resubmitted." % (self.failedList)
+            msg += " Jobs in status %s can also be resubmitted, but only if the jobid is specified and force = True." % (self.successList)
+            raise ExecutionError(msg)
+        ## If the user wants to resubmit a specific set of jobs ...
+        if jobids:
+            ## ... make the intersection between the "allowed" and "wanted" jobs.
+            resubmitjobids = list(set(resubmitjobids) & set(jobids))
+            ## Check if all the "wanted" jobs can be resubmitted. If not, fail the resubmission.
+            if len(resubmitjobids) != len(jobids):
+                requestedResub = list(set(jobids) - set(resubmitjobids))
+                msg  = "CRAB3 server refused to resubmit the following jobs: %s." % (str(requestedResub))
+                msg += " Only jobs in status %s can be resubmitted." % (self.failedList)
+                msg += " Jobs in status %s can also be resubmitted, but only if the jobid is specified and force = True." % (self.successList)
+                raise ExecutionError(msg) #return [{'result': msg}]
+        self.logger.info("Jobs to resubmit: %s" % (resubmitjobids))
+        ## If these parameters were not set in the resubmission request, give them the
+        ## same values they had in the original task submission.
+        if (siteblacklist is None) or (sitewhitelist is None) or (maxjobruntime is None) or (maxmemory is None) or (numcores is None) or (priority is None):
+            ## origValues = [orig_siteblacklist, orig_sitewhitelist, orig_maxjobruntime, orig_maxmemory, orig_numcores, orig_priority]
+            origValues = self.api.query(None, None, self.Task.GetResubmitParams_sql, taskname = workflow).next()
+            if siteblacklist is None:
+                siteblacklist = literal_eval(origValues[0])
+            if sitewhitelist is None:
+                sitewhitelist = literal_eval(origValues[1])
+            if maxjobruntime is None:
+                maxjobruntime = origValues[2]
+            if maxmemory is None:
+                maxmemory = origValues[3]
+            if numcores is None:
+                numcores = origValues[4]
+            if priority is None:
+                priority = origValues[5]
+        ## These are the parameters that we want to writte down in the 'tm_arguments'
+        ## column of the Tasks DB each time a resubmission is done.
+        ## DagmanResubmitter will read these parameters and write them into the task ad.
+        arguments = {'resubmit_jobids' : resubmitjobids,
+                     'site_blacklist'  : siteblacklist,
+                     'site_whitelist'  : sitewhitelist,
+                     'maxjobruntime'   : maxjobruntime,
+                     'maxmemory'       : maxmemory,
+                     'numcores'        : numcores,
+                     'priority'        : priority
+                    }
+        ## Change the 'tm_arguments' column of the Tasks DB for this task to contain the
+        ## above parameters.
+        self.api.modify(self.Task.SetArgumentsTask_sql, taskname = [workflow], arguments = [str(arguments)])
+        ## Change the status of the task in the Tasks DB to RESUBMIT.
+        self.api.modify(self.Task.SetStatusTask_sql, status = ["RESUBMIT"], taskname = [workflow])
+        return [{'result': retmsg}]
 
 
     def _updateTaskStatus(self, workflow, status, jobsPerStatus):
@@ -364,8 +403,7 @@ class DataWorkflow(object):
 
             args.update({"killList": killList, "killAll": jobids==[]})
             self.api.modify(self.Task.SetStatusTask_sql, status = ["KILL"], taskname = [workflow])
-            self.api.modify(self.Task.SetArgumentsTask_sql, taskname = [workflow],
-                            arguments = [dbSerializer(args)])
+            self.api.modify(self.Task.SetArgumentsTask_sql, taskname = [workflow], arguments = [dbSerializer(args)])
         elif statusRes['status'] == 'NEW':
             self.api.modify(self.Task.SetStatusTask_sql, status = ["KILLED"], taskname = [workflow])
         else:

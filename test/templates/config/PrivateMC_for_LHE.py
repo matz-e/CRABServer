@@ -7,12 +7,14 @@ config.General.workArea = 'CHANGE'
 config.General.transferOutputs = True
 config.General.transferLogs = True
 config.General.instance = 'preprod' 
+config.General.activity = 'analysistest'
 
 config.section_("JobType")
 config.JobType.pluginName = 'PrivateMC'
 config.JobType.generator = 'lhe'
 config.JobType.psetName = 'psets/pset_on_lhe.py'
 config.JobType.inputFiles = ['input_files/dynlo.lhe']
+config.JobType.disableAutomaticOutputCollection = False
 
 config.section_("Data")
 config.Data.primaryDataset = 'MinBias'

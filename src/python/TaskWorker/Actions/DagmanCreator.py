@@ -7,23 +7,23 @@ Generates the condor submit files and the master DAG.
 import os
 import re
 import json
-import base64
 import shutil
 import string
-import urllib
 import tarfile
 import hashlib
 import commands
 import tempfile
 from ast import literal_eval
+from httplib import HTTPException
 
-import TaskWorker.Actions.TaskAction as TaskAction
-import TaskWorker.DataObjects.Result
 import TaskWorker.WorkerExceptions
+import TaskWorker.DataObjects.Result
+import TaskWorker.Actions.TaskAction as TaskAction
+from TaskWorker.WorkerExceptions import TaskWorkerException
 
+import WMCore.WMSpec.WMTask
 import WMCore.Services.PhEDEx.PhEDEx as PhEDEx
 import WMCore.Services.SiteDB.SiteDB as SiteDB
-import WMCore.WMSpec.WMTask
 
 import classad
 
@@ -36,7 +36,7 @@ from ApmonIf import ApmonIf
 
 DAG_HEADER = """
 
-NODE_STATUS_FILE node_state 30
+NODE_STATUS_FILE node_state 30 ALWAYS-UPDATE
 
 # NOTE: a file must be present, but 'noop' makes it not be read.
 #FINAL FinalCleanup Job.1.submit NOOP
@@ -74,8 +74,6 @@ CRAB_HEADERS = \
 +CRAB_Publish = %(publication)s
 +CRAB_PublishDBSURL = %(publishdbsurl)s
 +CRAB_ISB = %(cacheurl)s
-+CRAB_SiteBlacklist = %(siteblacklist)s
-+CRAB_SiteWhitelist = %(sitewhitelist)s
 +CRAB_SaveLogsFlag = %(savelogsflag)s
 +CRAB_AdditionalOutputFiles = %(addoutputfiles)s
 +CRAB_EDMOutputFiles = %(edmoutfiles)s
@@ -153,11 +151,12 @@ periodic_remove = ((JobStatus =?= 5) && (time() - EnteredCurrentStatus > 7*60)) 
                   ((JobStatus =?= 2) && ( \
                      (MemoryUsage > RequestMemory) || \
                      (MaxWallTimeMins*60 < time() - EnteredCurrentStatus) || \
-                     (DiskUsage > 100000000) \
-                  ))
+                     (DiskUsage > 100000000))) || \
+                  ((JobStatus =?= 1) && (time() > (x509UserProxyExpiration + 86400)))
 +PeriodicRemoveReason = ifThenElse(MemoryUsage > RequestMemory, "Removed due to memory use", \
                           ifThenElse(MaxWallTimeMins*60 < time() - EnteredCurrentStatus, "Removed due to wall clock limit", \
-                            ifThenElse(DiskUsage > 100000000, "Removed due to disk usage", "Removed due to job being held")))
+                            ifThenElse(DiskUsage > 100000000, "Removed due to disk usage", \
+                              ifThenElse(time() > x509UserProxyExpiration, "Removed job due to proxy expiration", "Removed due to job being held"))))
 %(extra_jdl)s
 queue
 """
@@ -183,19 +182,16 @@ def makeLFNPrefixes(task):
         hash_input += "," + task['tm_user_group']
     if 'tm_user_role' in task and task['tm_user_role']:
         hash_input += "," + task['tm_user_role']
-    lfn = task.get('tm_arguments', {}).get('lfn', '')
-    lfn_prefix = task.get('tm_arguments', {}).get('lfnprefix', '')
+    lfn = task['tm_output_lfn'] if 'tm_output_lfn' in task else ''
+    ## For backward compatibility: old tasks were putting the outLFN in tm_arguments.
+    if not lfn:
+        lfn = task.get('tm_arguments', {}).get('lfn', '')
     hash = hashlib.sha1(hash_input).hexdigest()
-    #extracting the username for the lfn as long as https://github.com/dmwm/CRABServer/issues/4344 is sorted out. We need to do this because of https://hypernews.cern.ch/HyperNews/CMS/get/crabDevelopment/2076.html
-    user = task['tm_username'] if not lfn else lfn.split('/')[3]
+    user = task['tm_username']
     tmp_user = "%s.%s" % (user, hash)
     publish_info = task['tm_publish_name'].rsplit('-', 1) #publish_info[0] is the publishname or the taskname
     timestamp = getCreateTimestamp(task['tm_taskname'])
-    if lfn_prefix or not lfn: #keeping the lfn_prefix around so new task workers work with old servers (we should delete this soon) #TODO
-        #publish_info[0] will either be the unique taskname (stripped by the username) or the publishname
-        temp_dest = os.path.join("/store/temp/user", tmp_user, lfn_prefix, primaryds, publish_info[0], timestamp)
-        dest = os.path.join("/store/user", user, lfn_prefix, primaryds, publish_info[0], timestamp)
-    elif lfn:
+    if lfn:
         splitlfn = lfn.split('/')
         if splitlfn[2] == 'user':
             #join:                    /       store    /temp      /user  /mmascher.1234    /lfn          /GENSYM    /publishname     /120414_1634
@@ -204,8 +200,9 @@ def makeLFNPrefixes(task):
             temp_dest = os.path.join('/', splitlfn[1], 'temp', splitlfn[2], *( splitlfn[3:] + [primaryds, publish_info[0], timestamp] ))
         dest = os.path.join(lfn, primaryds, publish_info[0], timestamp)
     else:
-        raise TaskWorker.WorkerExceptions.TaskWorkerException("Cannot find the lfn parameter inside the tm_arguments."+\
-                                        "The CRAB server probably has a configuration error. Please contact an expert.")
+        #publish_info[0] will either be the unique taskname (stripped by the username) or the publishname
+        temp_dest = os.path.join("/store/temp/user", tmp_user, primaryds, publish_info[0], timestamp)
+        dest = os.path.join("/store/user", user, primaryds, publish_info[0], timestamp)
 
     return temp_dest, dest
 
@@ -261,6 +258,15 @@ def transform_strings(input):
 
 
 def getLocation(default_name, checkout_location):
+    """ Get the location of the runtime code (job wrapper, postjob, anything executed on the schedd
+        and on the worker node)
+
+        First check if the files are present in the current working directory
+        Then check if CRABTASKWORKER_ROOT is in the environment and use that location (that viariable is
+            set by the taskworker init script. In the prod source script we use "export CRABTASKWORKER_ROOT")
+        Finally, check if the CRAB3_CHECKOUT variable is set. That option is interesting for developer who
+            can use this to point to their github repository. (Marco: we need to check this)
+    """
     loc = default_name
     if not os.path.exists(loc):
         if 'CRABTASKWORKER_ROOT' in os.environ:
@@ -330,7 +336,7 @@ class DagmanCreator(TaskAction.TaskAction):
             dest_sites_.append(dest_site + "_Disk")
         try:
             pfn_info = self.phedex.getPFN(nodes=dest_sites_, lfns=lfns)
-        except HTTPException, ex:
+        except HTTPException as ex:
             self.logger.error(ex.headers)
             raise TaskWorker.WorkerExceptions.TaskWorkerException("The CRAB3 server backend could not contact phedex to do the site+lfn=>pfn translation.\n"+\
                                 "This is could be a temporary phedex glitch, please try to submit a new task (resubmit will not work)"+\
@@ -411,7 +417,10 @@ class DagmanCreator(TaskAction.TaskAction):
         info['addoutputfiles'] = task['tm_outfiles']
         info['tfileoutfiles'] = task['tm_tfile_outfiles']
         info['edmoutfiles'] = task['tm_edm_outfiles']
-        info['oneEventMode'] = 1 if task.get('tm_arguments', {}).get('oneEventMode', 'F') == 'T' else 0
+        if ('tm_one_event_mode' in info) and info['tm_one_event_mode'] is not None:
+            info['oneEventMode'] = 1 if info['tm_one_event_mode'] == 'T' else 0
+        else: ## For backward compatilibity only.
+            info['oneEventMode'] = 1 if task.get('tm_arguments', {}).get('oneEventMode', 'F') == 'T' else 0
         info['ASOURL'] = task['tm_asourl']
         info['taskType'] = self.getDashboardTaskType()
         info['worker_name'] = getattr(self.config.TaskWorker, 'name', 'unknown')
@@ -423,10 +432,16 @@ class DagmanCreator(TaskAction.TaskAction):
         # TODO: pass through these correctly.
         info['runs'] = []
         info['lumis'] = []
-        info['saveoutput'] = 1 if task.get('tm_arguments', {}).get('saveoutput', 'T') == 'T' else 0
+        if ('tm_transfer_outputs' in info) and info['tm_transfer_outputs'] is not None:
+            info['saveoutput'] = 1 if info['tm_transfer_outputs'] == 'T' else 0
+        else: ## For backward compatilibity only.
+            info['saveoutput'] = 1 if task.get('tm_arguments', {}).get('saveoutput', 'T') == 'T' else 0
         info['accounting_group'] = 'analysis.%s' % info['userhn']
         info = transform_strings(info)
-        info['faillimit'] = task.get('tm_arguments', {}).get('faillimit')
+        if ('tm_fail_limit' in info): ## We are not using faillimit currently, so it should be save to just ask if 'tm_fail_limit' is in info.
+            info['faillimit'] = info['tm_fail_limit']
+        else: ## For backward compatilibity only.
+            info['faillimit'] = task.get('tm_arguments', {}).get('faillimit')
         info['extra_jdl'] = '\n'.join(literal_eval(task['tm_extrajdl']))
         if info['jobarch_flatten'].startswith("slc6_"):
             info['opsys_req'] = '&& (GLIDEIN_REQUIRED_OS=?="rhel6" || OpSysMajorVer =?= 6)'
@@ -493,11 +508,6 @@ class DagmanCreator(TaskAction.TaskAction):
                 localOutputFiles.append("%s=%s" % (origFile, fileName))
             remoteOutputFilesStr = " ".join(remoteOutputFiles)
             localOutputFiles = ", ".join(localOutputFiles)
-            if task['tm_input_dataset']:
-                primaryds = task['tm_input_dataset'].split('/')[1]
-            else:
-                # For MC
-                primaryds = task['tm_publish_name'].rsplit('-', 1)[0]
             counter = "%04d" % (i / 1000)
             tempDest = os.path.join(temp_dest, counter)
             directDest = os.path.join(dest, counter)
@@ -559,19 +569,14 @@ class DagmanCreator(TaskAction.TaskAction):
 
         os.chmod("CMSRunAnalysis.sh", 0755)
 
-        # This config setting acts as a global black / white list
-        global_whitelist = set()
+        # This config setting acts as a global black list
         global_blacklist = set()
-        if hasattr(self.config.Sites, 'available'):
-            global_whitelist = set(self.config.Sites.available)
-        if hasattr(self.config.Sites, 'banned'):
-            global_blacklist = set(self.config.Sites.banned)
+
         # This is needed for Site Metrics
         # It should not block any site for Site Metrics and if needed for other activities
         # self.config.TaskWorker.ActivitiesToRunEverywhere = ['hctest', 'hcdev']
         if hasattr(self.config.TaskWorker, 'ActivitiesToRunEverywhere') and \
                    kwargs['task']['tm_activity'] in self.config.TaskWorker.ActivitiesToRunEverywhere:
-            global_whitelist = set()
             global_blacklist = set()
 
         sitead = classad.ClassAd()
@@ -580,18 +585,20 @@ class DagmanCreator(TaskAction.TaskAction):
             jobs = jobgroup.getJobs()
 
             whitelist = set(kwargs['task']['tm_site_whitelist'])
-
-            ignorelocality = kwargs['task'].get('tm_arguments', {}).get('ignorelocality', 'F') == 'T'
+            if 'tm_ignore_locality' in kwargs['task'] and kwargs['task']['tm_ignore_locality'] is not None:
+                ignorelocality = kwargs['task']['tm_ignore_locality'] == 'T'
+            else: ## For backward compatibility only.
+                ignorelocality = kwargs['task'].get('tm_arguments', {}).get('ignorelocality', 'F') == 'T'
             if not jobs:
                 possiblesites = []
             elif ignorelocality:
-                possiblesites = global_whitelist | whitelist
+                possiblesites = whitelist
                 if not possiblesites:
                     sbj = SiteDB.SiteDBJSON({"key":self.config.TaskWorker.cmskey,
                           "cert":self.config.TaskWorker.cmscert})
                     try:
                         possiblesites = set(sbj.getAllCMSNames())
-                    except Exception, ex:
+                    except Exception as ex:
                         raise TaskWorker.WorkerExceptions.TaskWorkerException("The CRAB3 server backend could not contact sitedb to get the list of all CMS sites.\n"+\
                             "This is could be a temporary sitedb glitch, please try to submit a new task (resubmit will not work)"+\
                             " and contact the experts if the error persists.\nError reason: %s" % str(ex)) #TODO add the sitedb url so the user can check themselves!
@@ -603,8 +610,6 @@ class DagmanCreator(TaskAction.TaskAction):
 
             # Apply globals
             availablesites = set(possiblesites) - global_blacklist
-            if global_whitelist:
-                availablesites &= global_whitelist
 
             if not availablesites:
                 msg = "The CRAB3 server backend refuses to send jobs to the Grid scheduler. No site available for submission of task %s" % (kwargs['task']['tm_taskname'])
@@ -728,49 +733,40 @@ class DagmanCreator(TaskAction.TaskAction):
 
 
     def executeInternal(self, *args, **kw):
+        # FIXME: In PanDA, we provided the executable as a URL.
+        # So, the filename becomes http:// -- and doesn't really work.  Hardcoding the analysis wrapper.
+        #transform_location = getLocation(kw['task']['tm_transformation'], 'CAFUtilities/src/python/transformation/CMSRunAnalysis/')
+        transform_location = getLocation('CMSRunAnalysis.sh', 'CRABServer/scripts/')
+        cmscp_location = getLocation('cmscp.py', 'CRABServer/scripts/')
+        gwms_location = getLocation('gWMS-CMSRunAnalysis.sh', 'CRABServer/scripts/')
+        dag_bootstrap_location = getLocation('dag_bootstrap_startup.sh', 'CRABServer/scripts/')
+        bootstrap_location = getLocation("dag_bootstrap.sh", "CRABServer/scripts/")
+        adjust_location = getLocation("AdjustSites.py", "CRABServer/scripts/")
 
-        cwd = None
-        if hasattr(self.config, 'TaskWorker') and hasattr(self.config.TaskWorker, 'scratchDir'):
-            temp_dir = tempfile.mkdtemp(prefix='_' + kw['task']['tm_taskname'], dir=self.config.TaskWorker.scratchDir)
+        shutil.copy(transform_location, '.')
+        shutil.copy(cmscp_location, '.')
+        shutil.copy(gwms_location, '.')
+        shutil.copy(dag_bootstrap_location, '.')
+        shutil.copy(bootstrap_location, '.')
+        shutil.copy(adjust_location, '.')
 
-            # FIXME: In PanDA, we provided the executable as a URL.
-            # So, the filename becomes http:// -- and doesn't really work.  Hardcoding the analysis wrapper.
-            #transform_location = getLocation(kw['task']['tm_transformation'], 'CAFUtilities/src/python/transformation/CMSRunAnalysis/')
-            transform_location = getLocation('CMSRunAnalysis.sh', 'CRABServer/scripts/')
-            cmscp_location = getLocation('cmscp.py', 'CRABServer/scripts/')
-            gwms_location = getLocation('gWMS-CMSRunAnalysis.sh', 'CRABServer/scripts/')
-            dag_bootstrap_location = getLocation('dag_bootstrap_startup.sh', 'CRABServer/scripts/')
-            bootstrap_location = getLocation("dag_bootstrap.sh", "CRABServer/scripts/")
-            adjust_location = getLocation("AdjustSites.py", "CRABServer/scripts/")
+        # Bootstrap the ISB if we are using UFC
+        if UserFileCache and kw['task']['tm_cache_url'].find('/crabcache')!=-1:
+            ufc = UserFileCache(dict={'cert': kw['task']['user_proxy'], 'key': kw['task']['user_proxy'], 'endpoint' : kw['task']['tm_cache_url']})
+            try:
+                ufc.download(hashkey=kw['task']['tm_user_sandbox'].split(".")[0], output="sandbox.tar.gz")
+            except Exception as ex:
+                self.logger.exception(ex)
+                raise TaskWorkerException("The CRAB3 server backend could not download the input sandbox with your code "+\
+                                    "from the frontend (crabcache component).\nThis could be a temporary glitch; please try to submit a new task later "+\
+                                    "(resubmit will not work) and contact the experts if the error persists.\nError reason: %s" % str(ex)) #TODO url!?
+            kw['task']['tm_user_sandbox'] = 'sandbox.tar.gz'
 
-            cwd = os.getcwd()
-            os.chdir(temp_dir)
-            shutil.copy(transform_location, '.')
-            shutil.copy(cmscp_location, '.')
-            shutil.copy(gwms_location, '.')
-            shutil.copy(dag_bootstrap_location, '.')
-            shutil.copy(bootstrap_location, '.')
-            shutil.copy(adjust_location, '.')
-
-            # Bootstrap the ISB if we are using UFC
-            if UserFileCache and kw['task']['tm_cache_url'].find('/crabcache')!=-1:
-                ufc = UserFileCache(dict={'cert': kw['task']['user_proxy'], 'key': kw['task']['user_proxy'], 'endpoint' : kw['task']['tm_cache_url']})
-                try:
-                    ufc.download(hashkey=kw['task']['tm_user_sandbox'].split(".")[0], output="sandbox.tar.gz")
-                except Exception, ex:
-                    self.logger.exception(ex)
-                    raise TaskWorker.WorkerExceptions.TaskWorkerException("The CRAB3 server backend could not download the input sandbox with your code "+\
-                                        "from the frontend (crabcache component).\nThis could be a temporary glitch; please try to submit a new task later "+\
-                                        "(resubmit will not work) and contact the experts if the error persists.\nError reason: %s" % str(ex)) #TODO url!?
-                kw['task']['tm_user_sandbox'] = 'sandbox.tar.gz'
-
-            # Bootstrap the runtime if it is available.
-            job_runtime = getLocation('CMSRunAnalysis.tar.gz', 'CRABServer/')
-            shutil.copy(job_runtime, '.')
-            task_runtime = getLocation('TaskManagerRun.tar.gz', 'CRABServer/')
-            shutil.copy(task_runtime, '.')
-
-            kw['task']['scratch'] = temp_dir
+        # Bootstrap the runtime if it is available.
+        job_runtime = getLocation('CMSRunAnalysis.tar.gz', 'CRABServer/')
+        shutil.copy(job_runtime, '.')
+        task_runtime = getLocation('TaskManagerRun.tar.gz', 'CRABServer/')
+        shutil.copy(task_runtime, '.')
 
         kw['task']['resthost'] = self.server['host']
         kw['task']['resturinoapi'] = self.restURInoAPI
@@ -789,14 +785,27 @@ class DagmanCreator(TaskAction.TaskAction):
         if os.path.exists("TaskManagerRun.tar.gz"):
             inputFiles.append("TaskManagerRun.tar.gz")
 
-        try:
             info, splitterResult, subdags = self.createSubdag(*args, **kw)
+
+        return info, params, inputFiles + subdags, splitterResult
+
+    def execute(self, *args, **kw):
+        cwd = None
+        try:
+            if hasattr(self.config, 'TaskWorker') and hasattr(self.config.TaskWorker, 'scratchDir'):
+                temp_dir = tempfile.mkdtemp(prefix='_' + kw['task']['tm_taskname'], dir=self.config.TaskWorker.scratchDir)
+                cwd = os.getcwd()
+                os.chdir(temp_dir)
+                kw['task']['scratch'] = temp_dir
+            else:
+                #I prefer to raise Exception and not TaskWorkerException since I want the whole stacktrace to be printed just in case
+                #this gets propagated to the client (should never happen in production as we test this before)
+                raise Exception(("The 'scratchDir' parameter is not set in the config.TaskWorker section of the configuration file."
+                                           " Please set config.TaskWorker.scratchDir in your Task Worker configuration"))
+
+            info, params, inputFiles, splitterResult = self.executeInternal(*args, **kw)
+            return TaskWorker.DataObjects.Result.Result(task = kw['task'], result = (temp_dir, info, params, inputFiles, splitterResult))
         finally:
             if cwd:
                 os.chdir(cwd)
-
-        return TaskWorker.DataObjects.Result.Result(task = kw['task'], result = (temp_dir, info, params, inputFiles + subdags, splitterResult))
-
-    def execute(self, *args, **kw):
-        return self.executeInternal(*args, **kw)
 

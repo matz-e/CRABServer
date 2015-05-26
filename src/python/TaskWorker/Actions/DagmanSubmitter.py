@@ -5,13 +5,13 @@ Submit a DAG directory created by the DagmanCreator component.
 
 import os
 import time
-import base64
 import random
 import urllib
 import traceback
 import subprocess
 
 import HTCondorUtils
+import CMSGroupMapper
 import HTCondorLocator
 
 from httplib import HTTPException
@@ -28,7 +28,7 @@ from RESTInteractions import HTTPRequests
 try:
     import classad
     import htcondor
-except ImportError, _:
+except ImportError as _:
     #pylint: disable=C0103
     classad = None
     htcondor = None
@@ -83,8 +83,6 @@ SUBMIT_INFO = [ \
             ('CRAB_Publish', 'publication'),
             ('CRAB_PublishDBSURL', 'publishdbsurl'),
             ('CRAB_ISB', 'cacheurl'),
-            ('CRAB_SiteBlacklist', 'siteblacklist'),
-            ('CRAB_SiteWhitelist', 'sitewhitelist'),
             ('CRAB_SaveLogsFlag', 'savelogsflag'),
             ('CRAB_AdditionalOutputFiles', 'addoutputfiles'),
             ('CRAB_EDMOutputFiles', 'edmoutfiles'),
@@ -112,6 +110,8 @@ SUBMIT_INFO = [ \
             ## schedd.submitRaw() method).
             ('CRAB_JobCount', 'jobcount'),
             ('CRAB_UserVO', 'tm_user_vo'),
+            ('CRAB_SiteBlacklist', 'siteblacklist'),
+            ('CRAB_SiteWhitelist', 'sitewhitelist'),
             ('RequestMemory', 'tm_maxmemory'),
             ('RequestCpus', 'tm_numcores'),
             ('MaxWallTimeMins', 'tm_maxjobruntime'),
@@ -149,13 +149,37 @@ class DagmanSubmitter(TaskAction.TaskAction):
         goodSchedulers = []
         try:
             goodSchedulers = self.server.get(self.restURInoAPI + '/info', data={'subresource': 'backendurls'})[0]['result'][0]['htcondorSchedds']
-        except HTTPException, hte:
+        except HTTPException as hte:
             self.logger.error(hte.headers)
             self.logger.warning("Unable to contact cmsweb. Will use only on schedulers which was chosen by CRAB3 frontend.")
-        self.logger.info(goodSchedulers)
+        self.logger.info("Good schedulers list got from crabserver: %s " % goodSchedulers)
         submissionFailure = False
         if kw['task']['tm_schedd'] not in goodSchedulers:
-            goodSchedulers.append(kw['task']['tm_schedd'])
+            self.logger.info("Scheduler which is chosen is not in crabserver output %s." % goodSchedulers)
+            self.logger.info("No late binding of schedd. Will use %s for submission." % kw['task']['tm_schedd'])
+            goodSchedulers = [kw['task']['tm_schedd']]
+        else:
+            #Make sure that first scheduler is used which is chosen by HTCondorLocator
+            try:
+                goodSchedulers.remove(kw['task']['tm_schedd'])
+            except ValueError:
+                pass
+            goodSchedulers.insert(0,kw['task']['tm_schedd'])
+        self.logger.info("Final good schedulers list after shuffle: %s " % goodSchedulers)
+
+        #Check memory and walltime and if user requires too much:
+        # upload warning back to crabserver
+        # change walltime to max 47h Issue: #4742
+        if kw['task']['tm_maxjobruntime'] > 2800:
+            msg = "task requests %s minutes of runtime but only %s is guaranteed to be available. Jobs may not find a site where to run. CRAB3 have changed this value to %s minutes" % (kw['task']['tm_maxjobruntime'], '2800', '2800')
+            self.logger.warning(msg)
+            args[0][1]['tm_maxjobruntime'] = '2800'
+            self.uploadWarning(msg, kw['task']['user_proxy'], kw['task']['tm_taskname'])
+        if kw['task']['tm_maxmemory'] > 2500:
+            msg = "task requests %s memory but only %s is guaranteed to be available. Jobs may not find a site where to run and stay idle forever" % (kw['task']['tm_maxmemory'], '2500')
+            self.logger.warning(msg)
+            self.uploadWarning(msg, kw['task']['user_proxy'], kw['task']['tm_taskname'])
+
         for schedd in goodSchedulers:
             #If submission failure is true, trying to change a scheduler
             configreq = {'workflow': kw['task']['tm_taskname'],
@@ -164,11 +188,11 @@ class DagmanSubmitter(TaskAction.TaskAction):
             try:
                 userServer.post(self.restURInoAPI + '/task', data = urllib.urlencode(configreq))
                 kw['task']['tm_schedd'] = schedd
-            except HTTPException, hte:
+            except HTTPException as hte:
                 msg = "Unable to contact cmsweb and update scheduler on which task will be submitted. Error msg: %s" % hte.headers
                 self.logger.warning(msg)
                 time.sleep(20)
-                retryIssuesBySchedd.setDefault(schedd, []).append(msg)
+                retryIssuesBySchedd.setdefault(schedd, []).append(msg)
                 continue
             for retry in range(self.config.TaskWorker.max_retry + 1): #max_retry can be 0
                 self.logger.debug("Trying to submit task %s %s time." % (kw['task']['tm_taskname'], str(retry)))
@@ -177,7 +201,7 @@ class DagmanSubmitter(TaskAction.TaskAction):
                 try:
                     execInt = self.executeInternal(*args, **kw)
                     return execInt
-                except Exception, e:
+                except Exception as e:
                     msg = "Failed to submit task %s; '%s'" % (kw['task']['tm_taskname'], str(e))
                     self.logger.error(msg)
                     retryIssues.append(msg)
@@ -212,7 +236,7 @@ class DagmanSubmitter(TaskAction.TaskAction):
         schedd = ""
         try:
             schedd, address = loc.getScheddObjNew(task['tm_schedd'])
-        except Exception, exp:
+        except Exception as exp:
             msg = ("%s: The CRAB3 server backend is not able to contact Grid scheduler. Please, retry later. Message from the scheduler: %s") % (workflow, str(exp))
             self.logger.exception(msg)
             raise TaskWorkerException(msg)
@@ -278,7 +302,7 @@ class DagmanSubmitter(TaskAction.TaskAction):
             schedd = ""
             try:
                 schedd, address = loc.getScheddObjNew(task['tm_schedd'])
-            except Exception, exp:
+            except Exception as exp:
                 msg = ("%s: The CRAB3 server backend is not able to contact Grid scheduler. Please, retry later. Message from the scheduler: %s") % (self.workflow, str(exp))
                 self.logger.exception(msg)
                 raise TaskWorkerException(msg)
@@ -326,15 +350,9 @@ class DagmanSubmitter(TaskAction.TaskAction):
         dagAd = classad.ClassAd()
         addCRABInfoToClassAd(dagAd, info)
 
-        # Set default task attributes:
-        if 'RequestMemory' not in dagAd:
-            dagAd['RequestMemory'] = 2000
-        if 'RequestCpus' not in dagAd:
-            dagAd['RequestCpus'] = 1
-        if 'MaxWallTimeMins' not in dagAd:
-            dagAd['MaxWallTimeMins'] = 1315
-        if 'JobPrio' not in dagAd:
-            dagAd['JobPrio'] = 10
+        groups = CMSGroupMapper.map_user_to_groups(dagAd["CRAB_UserHN"])
+        if groups:
+            dagAd["CMSGroups"] = groups
 
         # NOTE: Changes here must be synchronized with the job_submit in DagmanCreator.py in CAFTaskWorker
         dagAd["Out"] = str(os.path.join(info['scratch'], "request.out"))

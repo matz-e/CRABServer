@@ -64,7 +64,7 @@ class RESTUserWorkflow(RESTEntity):
             ## Default to '/store/user/<username>/' if the user did not specify the lfn parameter.
             kwargs['lfn'] = '/store/user/%s/' % (username)
         else:
-            msg  = "The parameter Data.outLFN in the CRAB configuration file must start with either"
+            msg  = "The parameter Data.outLFNDirBase in the CRAB configuration file must start with either"
             msg += " '/store/user/<username>/' or '/store/group/<groupname>/'"
             msg += " (or '/store/local/<something>/' if publication is off),"
             msg += " where username is your username as registered in SiteDB"
@@ -182,7 +182,7 @@ class RESTUserWorkflow(RESTEntity):
                       "Skipping the check of the releases"
             elif jobarch not in goodReleases or jobsw not in goodReleases[jobarch]:
                 msg = "ERROR: %s on %s is not among supported releases" % (jobsw, jobarch)
-                msg += "\nUse config.JobType.allowNonProductionCMSSW = True if you are sure of what you are doing"
+                msg += "\nUse config.JobType.allowUndistributedCMSSW = True if you are sure of what you are doing"
                 excasync = "ERROR: %s on %s is not among supported releases or an error occurred" % (jobsw, jobarch)
                 invalidp = InvalidParameter(msg, errobj = excasync)
                 setattr(invalidp, 'trace', '')
@@ -219,7 +219,6 @@ class RESTUserWorkflow(RESTEntity):
             validate_num("totalunits", param, safe, optional=True)
             validate_str("cachefilename", param, safe, RX_CACHENAME, optional=False)
             validate_str("cacheurl", param, safe, RX_CACHEURL, optional=False)
-            validate_str("lfnprefix", param, safe, RX_LFNPATH, optional=True) #keeping this for compatibility with old clients. Will be converted into a full lfn
             validate_str("lfn", param, safe, RX_LFN, optional=True)
             self._checkOutLFN(safe.kwargs)
             validate_strlist("addoutputfiles", param, safe, RX_ADDFILE)
@@ -306,16 +305,34 @@ class RESTUserWorkflow(RESTEntity):
         elif method in ['POST']:
             validate_str("workflow", param, safe, RX_UNIQUEWF, optional=False)
             validate_str("subresource", param, safe, RX_SUBRESTAT, optional=True)
-            validate_strlist("siteblacklist", param, safe, RX_CMSSITE)
-            safe.kwargs['siteblacklist'] = self._expandSites(safe.kwargs['siteblacklist'])
-            validate_strlist("sitewhitelist", param, safe, RX_CMSSITE)
-            safe.kwargs['sitewhitelist'] = self._expandSites(safe.kwargs['sitewhitelist'])
+            ## In a resubmission, the site black- and whitelists need to be interpreted
+            ## differently than in an initial task submission. If there is no site black-
+            ## or whitelist, set it to None and DataWorkflow will use the corresponding
+            ## list defined in the initial task submission. If the site black- or whitelist
+            ## is equal to the string 'empty', set it to an empty list and don't call
+            ## validate_strlist as it would fail.
+            if 'siteblacklist' not in param.kwargs:
+                safe.kwargs['siteblacklist'] = None
+            elif param.kwargs['siteblacklist'] == 'empty':
+                safe.kwargs['siteblacklist'] = []
+                del param.kwargs['siteblacklist']
+            else:
+                validate_strlist("siteblacklist", param, safe, RX_CMSSITE)
+                safe.kwargs['siteblacklist'] = self._expandSites(safe.kwargs['siteblacklist'])
+            if 'sitewhitelist' not in param.kwargs:
+                safe.kwargs['sitewhitelist'] = None
+            elif param.kwargs['sitewhitelist'] == 'empty':
+                safe.kwargs['sitewhitelist'] = []
+                del param.kwargs['sitewhitelist']
+            else:
+                validate_strlist("sitewhitelist", param, safe, RX_CMSSITE)
+                safe.kwargs['sitewhitelist'] = self._expandSites(safe.kwargs['sitewhitelist'])
             validate_numlist('jobids', param, safe)
             validate_num("priority", param, safe, optional=True)
             validate_num("maxjobruntime", param, safe, optional=True)
             validate_num("numcores", param, safe, optional=True)
             validate_num("maxmemory", param, safe, optional=True)
-
+            validate_num("force", param, safe, optional=True)
 
         elif method in ['GET']:
             validate_str("workflow", param, safe, RX_UNIQUEWF, optional=True)
@@ -351,7 +368,7 @@ class RESTUserWorkflow(RESTEntity):
     #@getUserCert(headers=cherrypy.request.headers)
     def put(self, workflow, activity, jobtype, jobsw, jobarch, inputdata, useparent, generator, eventsperlumi, siteblacklist, sitewhitelist, splitalgo, algoargs, cachefilename, cacheurl, addoutputfiles,\
                 savelogsflag, publication, publishname, asyncdest, dbsurl, publishdbsurl, vorole, vogroup, tfileoutfiles, edmoutfiles, runs, lumis,\
-                totalunits, adduserfiles, oneEventMode, maxjobruntime, numcores, maxmemory, priority, blacklistT1, nonprodsw, lfnprefix, lfn, saveoutput,
+                totalunits, adduserfiles, oneEventMode, maxjobruntime, numcores, maxmemory, priority, blacklistT1, nonprodsw, lfn, saveoutput,
                 faillimit, ignorelocality, userfiles, asourl, scriptexe, scriptargs, scheddname, extrajdl, collector, dryrun):
         """Perform the workflow injection
 
@@ -416,12 +433,12 @@ class RESTUserWorkflow(RESTEntity):
                                        publication=publication, publishname=publishname, asyncdest=asyncdest,
                                        dbsurl=dbsurl, publishdbsurl=publishdbsurl, tfileoutfiles=tfileoutfiles,
                                        edmoutfiles=edmoutfiles, runs=runs, lumis=lumis, totalunits=totalunits, adduserfiles=adduserfiles, oneEventMode=oneEventMode,
-                                       maxjobruntime=maxjobruntime, numcores=numcores, maxmemory=maxmemory, priority=priority, lfnprefix=lfnprefix, lfn=lfn,
+                                       maxjobruntime=maxjobruntime, numcores=numcores, maxmemory=maxmemory, priority=priority, lfn=lfn,
                                        ignorelocality=ignorelocality, saveoutput=saveoutput, faillimit=faillimit, userfiles=userfiles, asourl=asourl,
                                        scriptexe=scriptexe, scriptargs=scriptargs, scheddname=scheddname, extrajdl=extrajdl, collector=collector, dryrun=dryrun)
 
     @restcall
-    def post(self, workflow, subresource, siteblacklist, sitewhitelist, jobids, maxjobruntime, numcores, maxmemory, priority):
+    def post(self, workflow, subresource, siteblacklist, sitewhitelist, jobids, maxjobruntime, numcores, maxmemory, priority, force=0): # default value for force is only for backward compatibility.
         """Resubmit or continue an existing workflow. The caller needs to be a CMS user owner of the workflow.
 
            :arg str workflow: unique name identifier of the workflow;
@@ -430,9 +447,10 @@ class RESTUserWorkflow(RESTEntity):
         # strict check on authz: only the workflow owner can modify it
         authz_owner_match(self.api, [workflow], self.Task)
         if not subresource or subresource == 'resubmit':
-            return self.userworkflowmgr.resubmit(workflow=workflow, siteblacklist=siteblacklist, sitewhitelist=sitewhitelist, jobids=jobids, \
-                                        maxjobruntime=maxjobruntime, numcores=numcores, maxmemory=maxmemory, priority=priority,
-                                        userdn=cherrypy.request.headers['Cms-Authn-Dn'])
+            return self.userworkflowmgr.resubmit(workflow=workflow, \
+                                                 siteblacklist=siteblacklist, sitewhitelist=sitewhitelist, jobids=jobids, \
+                                                 maxjobruntime=maxjobruntime, numcores=numcores, maxmemory=maxmemory, priority=priority, force=force, \
+                                                 userdn=cherrypy.request.headers['Cms-Authn-Dn'])
         elif subresource == 'proceed':
             return self.userworkflowmgr.proceed(workflow=workflow)
 

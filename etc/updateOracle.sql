@@ -6,7 +6,7 @@ alter table tasks add (tm_extrajdl VARCHAR(1000));
 alter table tasks add (tm_generator VARCHAR(255));
 
 -- This is needed, because I was not allowed to change from VARCHAR to CLOB.
--- And I found this solution 
+-- And I found this solution
 --tm_outfiles CLOB
 ALTER TABLE tasks ADD tm_outfiles1 CLOB;
 UPDATE tasks SET tm_outfiles1 = tm_outfiles;
@@ -45,3 +45,11 @@ ALTER TABLE tasks ADD (tm_schedd VARCHAR(255));
 
 --Changes that will be needed for version 3.4.15
 alter table tasks add (tm_dry_run VARCHAR(1)); --for issue ##4462
+
+--Changes that will be needed for version 3.4.16
+alter table tasks add (tm_user_files CLOB DEFAULT '[]');
+alter table tasks add (tm_transfer_outputs VARCHAR(1));
+alter table tasks add (tm_output_lfn VARCHAR(1000));
+alter table tasks add (tm_ignore_locality VARCHAR(1));
+alter table tasks add (tm_fail_limit NUMBER(38));
+alter table tasks add (tm_one_event_mode VARCHAR(1));

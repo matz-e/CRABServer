@@ -18,13 +18,13 @@ from TaskWorker.Actions.DagmanCreator import DagmanCreator
 from TaskWorker.Actions.PanDAgetSpecs import PanDAgetSpecs
 from TaskWorker.Actions.PanDABrokerage import PanDABrokerage
 from TaskWorker.Actions.PanDAInjection import PanDAInjection
+from TaskWorker.Actions.DryRunUploader import DryRunUploader
 from TaskWorker.Actions.PanDASpecs2Jobs import PanDASpecs2Jobs
 from TaskWorker.Actions.MakeFakeFileSet import MakeFakeFileSet
 from TaskWorker.Actions.DagmanSubmitter import DagmanSubmitter
 from TaskWorker.Actions.DBSDataDiscovery import DBSDataDiscovery
 from TaskWorker.Actions.UserDataDiscovery import UserDataDiscovery
 from TaskWorker.Actions.DagmanResubmitter import DagmanResubmitter
-from TaskWorker.Actions.DryRunUploader import DryRunUploader
 from TaskWorker.WorkerExceptions import WorkerHandlerException, StopHandler, TaskWorkerException
 
 DEFAULT_BACKEND = 'panda'
@@ -72,15 +72,15 @@ class TaskHandler(object):
             t0 = time.time()
             try:
                 output = work.execute(nextinput, task=self._task)
-            except StopHandler, sh:
+            except StopHandler as sh:
                 msg = "Controlled stop of handler for %s on %s " % (self._task, str(sh))
                 self.logger.error(msg)
                 nextinput = Result(task=self._task, result='StopHandler exception received, controlled stop')
                 break #exit normally. Worker will not notice there was an error
-            except TaskWorkerException, twe:
+            except TaskWorkerException as twe:
                 self.logger.debug(str(traceback.format_exc())) #print the stacktrace only in debug mode
                 raise WorkerHandlerException(str(twe)) #TaskWorker error, do not add traceback to the error propagated to the REST
-            except Exception, exc:
+            except Exception as exc:
                 msg = "Problem handling %s because of %s failure, traceback follows\n" % (self._task['tm_taskname'], str(exc))
                 msg += str(traceback.format_exc())
                 self.logger.error(msg)
@@ -94,14 +94,15 @@ class TaskHandler(object):
                         ufc = UserFileCache(cacheurldict)
                         logfilename = self._task['tm_taskname'] + '_TaskWorker.log'
                         ufc.uploadLog(logpath, logfilename)
-                    except HTTPException, hte:
+                    except HTTPException as hte:
                         msg = ("Failed to upload the logfile to %s for task %s. More details in the http headers and body:\n%s\n%s" %
                                (self._task['tm_cache_url'], self._task['tm_taskname'], hte.headers, hte.result))
                         self.logger.error(msg)
-                    except Exception, e:
+                    except Exception as e:
                         msg = "Unknown error while uploading the logfile for task %s" % self._task['tm_taskname']
                         self.logger.exception(msg)
                 taskhandler.flush()
+                taskhandler.close()
                 self.logger.removeHandler(taskhandler)
             t1 = time.time()
             self.logger.info("Finished %s on %s in %d seconds" % (str(work), self._task['tm_taskname'], t1-t0))
@@ -110,6 +111,7 @@ class TaskHandler(object):
             except AttributeError:
                 nextinput = output
 
+        taskhandler.close()
         self.logger.removeHandler(taskhandler)
 
         return nextinput
@@ -128,7 +130,9 @@ def handleNewTask(resthost, resturi, config, task, procnum, *args, **kwargs):
     handler = TaskHandler(task, procnum)
     handler.addWork( MyProxyLogon(config=config, server=server, resturi=resturi, procnum=procnum, myproxylen=60*60*24) )
     if task['tm_job_type'] == 'Analysis': 
-        if task.get('tm_arguments', {}).get('userfiles'):
+        if task.get('tm_user_files'):
+            handler.addWork( UserDataDiscovery(config=config, server=server, resturi=resturi, procnum=procnum) )
+        elif task.get('tm_arguments', {}).get('userfiles'): ## For backward compatibility only.
             handler.addWork( UserDataDiscovery(config=config, server=server, resturi=resturi, procnum=procnum) )
         else:
             handler.addWork( DBSDataDiscovery(config=config, server=server, resturi=resturi, procnum=procnum) )

@@ -1,10 +1,16 @@
+import os
+import json
+import urllib
 import logging
+from base64 import b64encode
+from httplib import HTTPException
 
+from RESTInteractions import HTTPRequests
 
 class TaskAction(object):
     """The ABC of all actions"""
 
-    def __init__(self, config, server = None, resturi = None, procnum = -1):
+    def __init__(self, config, server = '', resturi = '', procnum = -1):
         self.logger = logging.getLogger(str(procnum))
         self.config = config
         self.jobtypeMapper = {'Analysis'  : 'Processing',
@@ -29,3 +35,26 @@ class TaskAction(object):
     def execute(self):
         raise NotImplementedError
 
+
+    def uploadWarning(self, warning, userProxy, taskname):
+        try:
+            userServer = HTTPRequests(self.server['host'], userProxy, userProxy, retry=2)
+            configreq = {'subresource': 'addwarning',
+                         'workflow': taskname,
+                         'warning': b64encode(warning)}
+            userServer.post(self.restURInoAPI + '/task', data = urllib.urlencode(configreq))
+        except HTTPException as hte:
+            self.logger.error(hte.headers)
+            self.logger.warning("Cannot add a warning to REST interface. Warning message: %s" % warning)
+
+    def getBlacklistedSites(self):
+        bannedSites = []
+        fileLocation = os.path.join(self.config.TaskWorker.scratchDir, "blacklistedSites.txt")
+        if os.path.isfile(fileLocation):
+            with open(fileLocation) as fd:
+                try:
+                    bannedSites = json.load(fd)
+                except ValueError as e:
+                    self.logger.error("Failed to load json from file %s. Error message: %s" % (fileLocation, e))
+                    return []
+        return bannedSites
